@@ -11,6 +11,8 @@ from redis.asyncio import Redis
 from redis.exceptions import ConnectionError
 import numpy as np
 
+from services.polymarket_client import PolymarketClient
+
 # Create logs directory if it doesn't exist
 os.makedirs('logs', exist_ok=True)
 
@@ -242,10 +244,11 @@ class InefficiencyDetector:
 class LMSRPredictionBot:
     """
     LMSR Prediction Market bot that:
-    1. Monitors market data via Redis pub/sub
-    2. Updates Bayesian beliefs from market signals
-    3. Computes LMSR prices and detects inefficiencies
-    4. Generates trading signals for mispriced outcomes
+    1. Polls Polymarket CLOB for live prices on binary markets
+    2. Updates Bayesian beliefs from price movement signals
+    3. Compares LMSR model prices against Polymarket prices to detect inefficiencies
+    4. Executes trades on Polymarket when edge exceeds threshold
+    5. Also accepts signals from Redis pub/sub (market & social data)
     """
 
     def __init__(self):
@@ -275,6 +278,21 @@ class LMSRPredictionBot:
         self.signal_processors: Dict[str, BayesianSignalProcessor] = {}
         # Active positions
         self.positions: Dict[str, Dict] = {}
+
+        # Polymarket integration
+        self.polymarket = PolymarketClient(self.config)
+        # condition_id -> polymarket parsed market data
+        self.poly_markets: Dict[str, Dict] = {}
+        # market_id -> condition_id mapping
+        self.market_to_condition: Dict[str, str] = {}
+        # Price history for signal generation: condition_id -> [prices]
+        self.price_history: Dict[str, List[Dict]] = {}
+
+        poly_config = self.config.get("polymarket", {})
+        self.poly_poll_interval = poly_config.get("poll_interval_sec", 10)
+        self.poly_max_markets = poly_config.get("max_tracked_markets", 20)
+        self.poly_auto_trade = poly_config.get("auto_trade", False)
+        self.poly_order_size = poly_config.get("default_order_size", 10.0)
 
         self.redis: Optional[Redis] = None
         self.running = True
@@ -439,7 +457,248 @@ class LMSRPredictionBot:
         return trade
 
     # ------------------------------------------------------------------
-    # Market data → signal conversion
+    # Polymarket integration
+    # ------------------------------------------------------------------
+
+    async def discover_polymarket_markets(self):
+        """Fetch tradable binary markets from Polymarket's Gamma API."""
+        tradable = await self.polymarket.discover_tradable_markets(
+            limit=self.poly_max_markets
+        )
+
+        for pm in tradable:
+            condition_id = pm["condition_id"]
+            if condition_id in self.poly_markets:
+                continue
+
+            self.poly_markets[condition_id] = pm
+            self.price_history[condition_id] = []
+
+            # Create an internal LMSR market for each Polymarket market
+            market = self._create_polymarket_mirror(pm)
+            self.market_to_condition[market.market_id] = condition_id
+
+            logger.info(
+                f"Tracking Polymarket market: {pm['question'][:80]} | "
+                f"prices={[t['price'] for t in pm['tokens']]}"
+            )
+
+        return len(tradable)
+
+    def _create_polymarket_mirror(self, pm: Dict) -> Market:
+        """Create an internal LMSR market mirroring a Polymarket market."""
+        condition_id = pm["condition_id"]
+        market_id = f"poly_{condition_id[:16]}"
+
+        # Use Polymarket's current prices as initial prior
+        initial_prices = pm.get("initial_prices", [0.5, 0.5])
+        prior = np.array(initial_prices)
+        prior = prior / prior.sum()  # normalize
+
+        market = Market(
+            market_id=market_id,
+            symbol=condition_id,
+            description=pm.get("question", ""),
+            outcomes=[Outcome(name=o) for o in pm.get("outcomes", ["Yes", "No"])],
+        )
+        self.markets[market_id] = market
+        self.signal_processors[market_id] = BayesianSignalProcessor(
+            n_outcomes=len(market.outcomes), prior=prior
+        )
+        return market
+
+    async def poll_polymarket_prices(self):
+        """
+        Continuously poll Polymarket CLOB for price updates.
+        Generates signals from price movements and detects inefficiencies.
+        """
+        logger.info(
+            f"Starting Polymarket price polling | "
+            f"interval={self.poly_poll_interval}s | "
+            f"auto_trade={self.poly_auto_trade}"
+        )
+
+        while self.running:
+            for condition_id, pm in list(self.poly_markets.items()):
+                if not self.running:
+                    break
+
+                try:
+                    prices = await self.polymarket.get_market_prices(pm)
+                    if not prices:
+                        continue
+
+                    # Build price snapshot
+                    snapshot = {
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "prices": prices,
+                    }
+                    history = self.price_history.get(condition_id, [])
+                    history.append(snapshot)
+                    # Keep last 100 snapshots
+                    if len(history) > 100:
+                        history = history[-100:]
+                    self.price_history[condition_id] = history
+
+                    # Find the internal market
+                    market_id = self._find_market_for_condition(condition_id)
+                    if not market_id:
+                        continue
+
+                    # Generate signals from price movements
+                    signals = self._polymarket_price_to_signals(condition_id, prices)
+
+                    all_opportunities = []
+                    for signal in signals:
+                        opps = self.process_market_signal(market_id, signal)
+                        if opps:
+                            all_opportunities.extend(opps)
+
+                    # Check for inefficiencies against live Polymarket prices
+                    if all_opportunities:
+                        best = self._deduplicate_opportunities(all_opportunities)
+                        for opp in best:
+                            opp["condition_id"] = condition_id
+                            opp["polymarket_tokens"] = pm.get("tokens", [])
+                            opp["question"] = pm.get("question", "")
+
+                            logger.info(
+                                f"OPPORTUNITY | {pm['question'][:60]} | "
+                                f"{opp['direction']} outcome={opp['outcome_idx']} | "
+                                f"edge={opp['edge']:.4f} kelly={opp['kelly_fraction']:.4f} | "
+                                f"market={opp['market_price']:.4f} model={opp['model_belief']:.4f}"
+                            )
+
+                            # Execute trade if auto_trade is enabled
+                            if self.poly_auto_trade:
+                                await self._execute_polymarket_trade(opp)
+
+                            # Publish to Redis
+                            if self.redis:
+                                await self.publish_opportunity(market_id, opp)
+
+                except Exception as e:
+                    logger.error(
+                        f"Error polling {condition_id[:16]}: {e}", exc_info=True
+                    )
+
+            await asyncio.sleep(self.poly_poll_interval)
+
+    def _find_market_for_condition(self, condition_id: str) -> Optional[str]:
+        """Find internal market_id for a Polymarket condition_id."""
+        for mid, cid in self.market_to_condition.items():
+            if cid == condition_id:
+                return mid
+        return None
+
+    def _polymarket_price_to_signals(self, condition_id: str,
+                                     prices: Dict[str, float]) -> List[Dict]:
+        """Generate signals from Polymarket price movements."""
+        signals = []
+        history = self.price_history.get(condition_id, [])
+
+        yes_price = prices.get("Yes", prices.get("YES", 0.5))
+        no_price = prices.get("No", prices.get("NO", 0.5))
+
+        # Price momentum signal: compare to previous snapshot
+        if len(history) >= 2:
+            prev = history[-2]["prices"]
+            prev_yes = prev.get("Yes", prev.get("YES", 0.5))
+            delta = yes_price - prev_yes
+
+            if abs(delta) > 0.005:
+                signals.append({
+                    "signal_type": "price_move",
+                    "strength": min(abs(delta) / 0.05, 1.0),
+                    "direction": "up" if delta > 0 else "down",
+                    "metadata": {"source": "polymarket_price_delta", "value": delta},
+                })
+
+        # Trend signal: compare to 10 snapshots ago
+        if len(history) >= 10:
+            old = history[-10]["prices"]
+            old_yes = old.get("Yes", old.get("YES", 0.5))
+            trend = yes_price - old_yes
+
+            if abs(trend) > 0.01:
+                signals.append({
+                    "signal_type": "technical",
+                    "strength": min(abs(trend) / 0.10, 1.0),
+                    "direction": "up" if trend > 0 else "down",
+                    "metadata": {"source": "polymarket_trend", "value": trend},
+                })
+
+        # Extreme price signal (RSI-like): price near boundaries
+        if yes_price > 0.85 or yes_price < 0.15:
+            signals.append({
+                "signal_type": "technical",
+                "strength": max(abs(yes_price - 0.5) * 2 - 0.5, 0.3),
+                "direction": "up" if yes_price > 0.5 else "down",
+                "metadata": {"source": "price_extreme", "value": yes_price},
+            })
+
+        return signals
+
+    async def _execute_polymarket_trade(self, opportunity: Dict):
+        """Execute a trade on Polymarket based on a detected opportunity."""
+        tokens = opportunity.get("polymarket_tokens", [])
+        if not tokens:
+            return
+
+        outcome_idx = opportunity["outcome_idx"]
+        direction = opportunity["direction"]
+
+        if outcome_idx >= len(tokens):
+            return
+
+        token = tokens[outcome_idx]
+        token_id = token.get("token_id", "")
+        if not token_id:
+            return
+
+        kelly = opportunity["kelly_fraction"]
+        order_amount = self.poly_order_size * kelly
+
+        if order_amount < 1.0:
+            logger.debug(f"Order amount ${order_amount:.2f} too small, skipping")
+            return
+
+        # Use limit order at model belief price for better fill
+        limit_price = opportunity["model_belief"]
+        # Clamp to valid Polymarket range
+        limit_price = max(0.01, min(0.99, limit_price))
+        size = order_amount / limit_price
+
+        result = self.polymarket.place_limit_order(
+            token_id=token_id,
+            price=round(limit_price, 2),
+            size=round(size, 2),
+            side=direction,
+        )
+
+        if result:
+            self.positions[token_id] = {
+                "condition_id": opportunity.get("condition_id"),
+                "outcome_idx": outcome_idx,
+                "direction": direction,
+                "entry_price": opportunity["market_price"],
+                "size": size,
+                "order_result": result,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+
+    @staticmethod
+    def _deduplicate_opportunities(opportunities: List[Dict]) -> List[Dict]:
+        """De-duplicate by outcome_idx, keeping highest edge."""
+        best = {}
+        for opp in opportunities:
+            idx = opp["outcome_idx"]
+            if idx not in best or opp["abs_edge"] > best[idx]["abs_edge"]:
+                best[idx] = opp
+        return list(best.values())
+
+    # ------------------------------------------------------------------
+    # Market data → signal conversion (Redis-sourced data)
     # ------------------------------------------------------------------
 
     def _market_data_to_signals(self, data: Dict) -> List[Dict]:
@@ -638,13 +897,8 @@ class LMSRPredictionBot:
 
                 # Publish best opportunities
                 if all_opportunities:
-                    # De-duplicate by outcome_idx, keep highest edge
-                    best = {}
-                    for opp in all_opportunities:
-                        idx = opp["outcome_idx"]
-                        if idx not in best or opp["abs_edge"] > best[idx]["abs_edge"]:
-                            best[idx] = opp
-                    for opp in best.values():
+                    best = self._deduplicate_opportunities(all_opportunities)
+                    for opp in best:
                         await self.publish_opportunity(market_id, opp)
 
                 # Periodically publish state
@@ -707,10 +961,13 @@ class LMSRPredictionBot:
 
         return {
             "active_markets": len(self.markets),
+            "polymarket_markets": len(self.poly_markets),
             "resolved_markets": sum(1 for m in self.markets.values() if m.resolved),
+            "active_positions": len(self.positions),
             "liquidity_parameter": self.liquidity,
             "max_maker_loss_binary": float(self.pricing_engine.max_loss(2)),
             "min_edge_threshold": self.min_edge,
+            "auto_trade": self.poly_auto_trade,
             "markets": market_states,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
@@ -720,37 +977,63 @@ class LMSRPredictionBot:
     # ------------------------------------------------------------------
 
     async def run(self):
-        """Main entry point: connect to Redis and start processing."""
+        """Main entry point: discover Polymarket markets and start processing."""
         logger.info("=" * 60)
-        logger.info("LMSR Prediction Bot starting")
+        logger.info("LMSR Prediction Bot starting (Polymarket mode)")
         logger.info(f"  Liquidity (b): {self.liquidity:,.0f}")
         logger.info(f"  Max maker loss (binary): ${self.pricing_engine.max_loss(2):,.2f}")
         logger.info(f"  Min edge threshold: {self.min_edge}")
         logger.info(f"  Max Kelly fraction: {self.max_kelly_fraction}")
         logger.info(f"  Signal learning rate: {self.signal_learning_rate}")
+        logger.info(f"  Polymarket poll interval: {self.poly_poll_interval}s")
+        logger.info(f"  Auto-trade: {self.poly_auto_trade}")
         logger.info("=" * 60)
 
+        # Discover Polymarket markets
+        n_markets = await self.discover_polymarket_markets()
+        logger.info(f"Discovered {n_markets} tradable Polymarket markets")
+
+        # Connect to Redis (optional — bot works without it)
         connected = await self.connect_redis()
         if not connected:
-            logger.error("Cannot start without Redis connection. Exiting.")
-            return
-
-        # Run both listeners concurrently
-        try:
-            await asyncio.gather(
-                self.listen_market_updates(),
-                self.listen_social_updates(),
-                self._status_loop(),
+            logger.warning(
+                "Redis not available — running in Polymarket-only mode "
+                "(no Redis pub/sub signals)"
             )
+
+        # Build task list
+        tasks = [
+            self.poll_polymarket_prices(),
+            self._polymarket_discovery_loop(),
+            self._status_loop(),
+        ]
+        if connected:
+            tasks.append(self.listen_market_updates())
+            tasks.append(self.listen_social_updates())
+
+        try:
+            await asyncio.gather(*tasks)
         except asyncio.CancelledError:
             logger.info("Bot tasks cancelled")
         except Exception as e:
             logger.error(f"Bot error: {e}", exc_info=True)
         finally:
             self.running = False
+            await self.polymarket.close()
             if self.redis:
                 await self.redis.close()
             logger.info("LMSR Prediction Bot stopped")
+
+    async def _polymarket_discovery_loop(self):
+        """Periodically discover new Polymarket markets."""
+        while self.running:
+            await asyncio.sleep(300)  # Re-scan every 5 minutes
+            try:
+                n = await self.discover_polymarket_markets()
+                if n > 0:
+                    logger.info(f"Discovery refresh: {n} markets, {len(self.poly_markets)} tracked")
+            except Exception as e:
+                logger.error(f"Market discovery error: {e}")
 
     async def _status_loop(self):
         """Periodically log bot status."""

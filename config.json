@@ -159,6 +159,21 @@
             "sentiment": 0.6
         }
     },
+    "polymarket": {
+        "gamma_api_url": "https://gamma-api.polymarket.com",
+        "clob_api_url": "https://clob.polymarket.com",
+        "ws_url": "wss://ws-subscriptions-clob.polymarket.com",
+        "chain_id": 137,
+        "signature_type": 0,
+        "poll_interval_sec": 10,
+        "max_tracked_markets": 20,
+        "auto_trade": false,
+        "default_order_size": 10.0,
+        "min_liquidity": 10000,
+        "market_tags": [],
+        "active_only": true,
+        "request_interval_sec": 1.0
+    },
     "worker_defaults": {
         "routes": {
             "strategy": "/api/strategy/*",
