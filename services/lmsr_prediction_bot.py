@@ -1,0 +1,772 @@
+import os
+import json
+import math
+import asyncio
+import logging as logger
+from logging.handlers import RotatingFileHandler
+from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+from redis.asyncio import Redis
+from redis.exceptions import ConnectionError
+import numpy as np
+
+# Create logs directory if it doesn't exist
+os.makedirs('logs', exist_ok=True)
+
+# Configure rotating file handler
+rotating_handler = RotatingFileHandler(
+    'logs/lmsr_prediction_bot.log',
+    maxBytes=10*1024*1024,
+    backupCount=5,
+    encoding='utf-8'
+)
+
+logger.basicConfig(
+    level=logger.DEBUG,
+    format='%(asctime)s - %(levelname)s - [LMSRBot] %(message)s',
+    handlers=[
+        rotating_handler,
+        logger.StreamHandler()
+    ]
+)
+
+
+@dataclass
+class Outcome:
+    """Represents a single outcome in a prediction market."""
+    name: str
+    quantity: float = 0.0
+
+
+@dataclass
+class Market:
+    """A prediction market with LMSR pricing."""
+    market_id: str
+    symbol: str
+    description: str
+    outcomes: List[Outcome] = field(default_factory=list)
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    resolved: bool = False
+    resolution_outcome: Optional[int] = None
+
+
+@dataclass
+class BayesianBelief:
+    """Tracks Bayesian posterior beliefs for a market's outcomes."""
+    log_posteriors: np.ndarray  # log-space posteriors for numerical stability
+    update_count: int = 0
+    last_updated: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+    @property
+    def posteriors(self) -> np.ndarray:
+        """Convert log-posteriors to probabilities via softmax normalization."""
+        shifted = self.log_posteriors - np.max(self.log_posteriors)
+        exp_vals = np.exp(shifted)
+        return exp_vals / np.sum(exp_vals)
+
+
+class LMSRPricingEngine:
+    """
+    Logarithmic Market Scoring Rule (LMSR) pricing engine.
+
+    Implements the Hanson LMSR cost function:
+        C(q) = b * ln(sum(exp(q_i / b)))
+
+    Price function (softmax):
+        p_i = exp(q_i / b) / sum(exp(q_j / b))
+    """
+
+    def __init__(self, liquidity: float = 100_000.0):
+        self.b = liquidity
+
+    def cost(self, quantities: np.ndarray) -> float:
+        """
+        LMSR cost function: C(q) = b * ln(sum(exp(q_i / b)))
+
+        Uses log-sum-exp trick for numerical stability.
+        """
+        scaled = quantities / self.b
+        max_scaled = np.max(scaled)
+        return self.b * (max_scaled + math.log(np.sum(np.exp(scaled - max_scaled))))
+
+    def prices(self, quantities: np.ndarray) -> np.ndarray:
+        """
+        Instantaneous prices via softmax: p_i = exp(q_i / b) / sum(exp(q_j / b))
+
+        Properties: sum(p_i) = 1 and p_i in (0, 1) for all i.
+        """
+        scaled = quantities / self.b
+        shifted = scaled - np.max(scaled)
+        exp_vals = np.exp(shifted)
+        return exp_vals / np.sum(exp_vals)
+
+    def trade_cost(self, quantities: np.ndarray, outcome_idx: int, delta: float) -> float:
+        """
+        Cost to move outcome i from q_i to q_i + delta:
+            TradeCost = C(q_1, ..., q_i + delta, ..., q_n) - C(q_1, ..., q_i, ..., q_n)
+        """
+        cost_before = self.cost(quantities)
+        new_quantities = quantities.copy()
+        new_quantities[outcome_idx] += delta
+        cost_after = self.cost(new_quantities)
+        return cost_after - cost_before
+
+    def max_loss(self, n_outcomes: int) -> float:
+        """Maximum market maker loss: L_max = b * ln(n)"""
+        return self.b * math.log(n_outcomes)
+
+
+class BayesianSignalProcessor:
+    """
+    Sequential Bayesian belief updater operating in log-space
+    for numerical stability.
+
+    Update rule:
+        log P(H|D) = log P(D|H) + log P(H) - log Z
+
+    where Z is the normalizing constant.
+    """
+
+    def __init__(self, n_outcomes: int, prior: Optional[np.ndarray] = None):
+        if prior is not None:
+            self.belief = BayesianBelief(log_posteriors=np.log(prior))
+        else:
+            # Uniform prior
+            uniform = np.ones(n_outcomes) / n_outcomes
+            self.belief = BayesianBelief(log_posteriors=np.log(uniform))
+
+    def update(self, log_likelihoods: np.ndarray) -> np.ndarray:
+        """
+        Sequential Bayesian update in log-space:
+            log_posterior = log_prior + log_likelihood - log_Z
+        """
+        unnormalized = self.belief.log_posteriors + log_likelihoods
+        # Normalize in log-space (log-sum-exp)
+        max_val = np.max(unnormalized)
+        log_z = max_val + math.log(np.sum(np.exp(unnormalized - max_val)))
+        self.belief.log_posteriors = unnormalized - log_z
+        self.belief.update_count += 1
+        self.belief.last_updated = datetime.now(timezone.utc).isoformat()
+        return self.belief.posteriors
+
+    def update_from_signal(self, signal_strength: float, favored_outcome: int,
+                           n_outcomes: int, base_lr: float = 0.1) -> np.ndarray:
+        """
+        Convert a directional signal into log-likelihoods and update beliefs.
+
+        Args:
+            signal_strength: Signal magnitude in [0, 1]. Higher = stronger evidence.
+            favored_outcome: Index of the outcome favored by the signal.
+            n_outcomes: Total number of outcomes.
+            base_lr: Base learning rate controlling update magnitude.
+        """
+        log_likelihoods = np.zeros(n_outcomes)
+        boost = base_lr * signal_strength
+        log_likelihoods[favored_outcome] = boost
+        # Distribute negative evidence to other outcomes
+        penalty = -boost / (n_outcomes - 1) if n_outcomes > 1 else 0.0
+        for i in range(n_outcomes):
+            if i != favored_outcome:
+                log_likelihoods[i] = penalty
+        return self.update(log_likelihoods)
+
+    @property
+    def posteriors(self) -> np.ndarray:
+        return self.belief.posteriors
+
+
+class InefficiencyDetector:
+    """
+    Detects mispricing between LMSR market prices and Bayesian model beliefs.
+
+    Entry condition: |p_market_i - p_model_i| > threshold
+
+    Expected value of a trade at market price p with true probability p_hat:
+        EV = p_hat - p  (for buying)
+    """
+
+    def __init__(self, min_edge: float = 0.05, min_confidence: float = 0.6,
+                 max_kelly_fraction: float = 0.25):
+        self.min_edge = min_edge
+        self.min_confidence = min_confidence
+        self.max_kelly_fraction = max_kelly_fraction
+
+    def detect(self, market_prices: np.ndarray,
+               model_beliefs: np.ndarray) -> List[Dict]:
+        """
+        Find outcomes where model beliefs diverge significantly from market prices.
+        Returns a list of trading opportunities.
+        """
+        opportunities = []
+        for i in range(len(market_prices)):
+            edge = model_beliefs[i] - market_prices[i]
+            abs_edge = abs(edge)
+
+            if abs_edge < self.min_edge:
+                continue
+            if model_beliefs[i] < self.min_confidence and edge > 0:
+                # Only require confidence for buys, not shorts
+                pass
+
+            direction = "BUY" if edge > 0 else "SELL"
+            ev = edge  # EV = p_hat - p (per unit)
+
+            # Kelly criterion for position sizing: f* = edge / (1 - p_market)
+            # Capped at max_kelly_fraction
+            if direction == "BUY":
+                odds_against = (1.0 - market_prices[i])
+                kelly = edge / odds_against if odds_against > 0 else 0.0
+            else:
+                odds_against = market_prices[i]
+                kelly = abs_edge / odds_against if odds_against > 0 else 0.0
+
+            kelly = min(kelly, self.max_kelly_fraction)
+
+            opportunities.append({
+                "outcome_idx": i,
+                "direction": direction,
+                "market_price": float(market_prices[i]),
+                "model_belief": float(model_beliefs[i]),
+                "edge": float(edge),
+                "abs_edge": float(abs_edge),
+                "expected_value": float(ev),
+                "kelly_fraction": float(kelly),
+            })
+
+        # Sort by absolute edge descending
+        opportunities.sort(key=lambda x: x["abs_edge"], reverse=True)
+        return opportunities
+
+
+class LMSRPredictionBot:
+    """
+    LMSR Prediction Market bot that:
+    1. Monitors market data via Redis pub/sub
+    2. Updates Bayesian beliefs from market signals
+    3. Computes LMSR prices and detects inefficiencies
+    4. Generates trading signals for mispriced outcomes
+    """
+
+    def __init__(self):
+        with open('config.json', 'r') as f:
+            self.config = json.load(f)
+
+        lmsr_config = self.config.get("lmsr", {})
+        self.liquidity = lmsr_config.get("liquidity_parameter", 100_000.0)
+        self.min_edge = lmsr_config.get("min_edge", 0.05)
+        self.min_confidence = lmsr_config.get("min_confidence", 0.6)
+        self.max_kelly_fraction = lmsr_config.get("max_kelly_fraction", 0.25)
+        self.update_interval = lmsr_config.get("update_interval_sec", 5)
+        self.signal_learning_rate = lmsr_config.get("signal_learning_rate", 0.1)
+        self.max_position_size = lmsr_config.get("max_position_size", 0.3)
+        self.max_open_positions = lmsr_config.get("max_open_positions", 5)
+
+        self.pricing_engine = LMSRPricingEngine(self.liquidity)
+        self.inefficiency_detector = InefficiencyDetector(
+            min_edge=self.min_edge,
+            min_confidence=self.min_confidence,
+            max_kelly_fraction=self.max_kelly_fraction,
+        )
+
+        # Active markets: market_id -> Market
+        self.markets: Dict[str, Market] = {}
+        # Bayesian processors per market: market_id -> BayesianSignalProcessor
+        self.signal_processors: Dict[str, BayesianSignalProcessor] = {}
+        # Active positions
+        self.positions: Dict[str, Dict] = {}
+
+        self.redis: Optional[Redis] = None
+        self.running = True
+
+    # ------------------------------------------------------------------
+    # Market management
+    # ------------------------------------------------------------------
+
+    def create_binary_market(self, symbol: str, description: str = "") -> Market:
+        """
+        Create a binary (YES/NO) prediction market for a symbol.
+        Binary market with n=2: max loss = b * ln(2).
+        """
+        market_id = f"lmsr_{symbol}_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+        market = Market(
+            market_id=market_id,
+            symbol=symbol,
+            description=description or f"Will {symbol} go up in the next interval?",
+            outcomes=[Outcome(name="YES"), Outcome(name="NO")],
+        )
+        self.markets[market_id] = market
+        self.signal_processors[market_id] = BayesianSignalProcessor(n_outcomes=2)
+
+        max_loss = self.pricing_engine.max_loss(2)
+        logger.info(
+            f"Created binary market {market_id} for {symbol} | "
+            f"b={self.liquidity} | max_loss=${max_loss:,.2f}"
+        )
+        return market
+
+    def get_market_state(self, market_id: str) -> Optional[Dict]:
+        """Get current state of a market including prices and beliefs."""
+        market = self.markets.get(market_id)
+        if not market:
+            return None
+
+        quantities = np.array([o.quantity for o in market.outcomes])
+        prices = self.pricing_engine.prices(quantities)
+        processor = self.signal_processors.get(market_id)
+        beliefs = processor.posteriors if processor else prices
+
+        return {
+            "market_id": market_id,
+            "symbol": market.symbol,
+            "description": market.description,
+            "outcomes": [
+                {
+                    "name": o.name,
+                    "quantity": o.quantity,
+                    "price": float(prices[i]),
+                    "belief": float(beliefs[i]),
+                }
+                for i, o in enumerate(market.outcomes)
+            ],
+            "resolved": market.resolved,
+            "created_at": market.created_at,
+            "belief_updates": processor.belief.update_count if processor else 0,
+        }
+
+    # ------------------------------------------------------------------
+    # Signal processing
+    # ------------------------------------------------------------------
+
+    def process_market_signal(self, market_id: str, signal: Dict) -> Optional[List[Dict]]:
+        """
+        Process an incoming market signal, update Bayesian beliefs,
+        and detect inefficiencies.
+
+        Signal format:
+        {
+            "signal_type": "price_move" | "volume_spike" | "social" | "technical",
+            "strength": float [0, 1],
+            "direction": "up" | "down",
+            "metadata": {...}
+        }
+        """
+        market = self.markets.get(market_id)
+        processor = self.signal_processors.get(market_id)
+        if not market or not processor:
+            logger.warning(f"Unknown market: {market_id}")
+            return None
+
+        n = len(market.outcomes)
+        signal_type = signal.get("signal_type", "unknown")
+        strength = min(max(signal.get("strength", 0.0), 0.0), 1.0)
+        direction = signal.get("direction", "up")
+
+        # Map direction to favored outcome (0=YES/up, 1=NO/down for binary)
+        favored = 0 if direction == "up" else 1
+
+        # Apply signal-type-specific learning rate multiplier
+        lr_multipliers = {
+            "price_move": 1.0,
+            "volume_spike": 0.8,
+            "social": 0.5,
+            "technical": 1.2,
+            "sentiment": 0.6,
+        }
+        lr = self.signal_learning_rate * lr_multipliers.get(signal_type, 0.7)
+
+        # Bayesian update
+        new_beliefs = processor.update_from_signal(
+            signal_strength=strength,
+            favored_outcome=favored,
+            n_outcomes=n,
+            base_lr=lr,
+        )
+
+        # Current LMSR prices
+        quantities = np.array([o.quantity for o in market.outcomes])
+        market_prices = self.pricing_engine.prices(quantities)
+
+        # Detect inefficiencies
+        opportunities = self.inefficiency_detector.detect(market_prices, new_beliefs)
+
+        if opportunities:
+            logger.info(
+                f"Market {market_id} | signal={signal_type} str={strength:.2f} "
+                f"dir={direction} | beliefs={new_beliefs.round(4)} | "
+                f"prices={market_prices.round(4)} | "
+                f"found {len(opportunities)} opportunities"
+            )
+
+        return opportunities
+
+    def execute_trade(self, market_id: str, outcome_idx: int,
+                      delta: float) -> Optional[Dict]:
+        """
+        Execute a trade on a market: buy delta shares of outcome_idx.
+        Returns trade details including cost.
+        """
+        market = self.markets.get(market_id)
+        if not market or market.resolved:
+            return None
+
+        quantities = np.array([o.quantity for o in market.outcomes])
+        cost = self.pricing_engine.trade_cost(quantities, outcome_idx, delta)
+        price_before = self.pricing_engine.prices(quantities)[outcome_idx]
+
+        # Update quantity
+        market.outcomes[outcome_idx].quantity += delta
+
+        new_quantities = np.array([o.quantity for o in market.outcomes])
+        price_after = self.pricing_engine.prices(new_quantities)[outcome_idx]
+
+        trade = {
+            "market_id": market_id,
+            "outcome_idx": outcome_idx,
+            "outcome_name": market.outcomes[outcome_idx].name,
+            "delta": delta,
+            "cost": float(cost),
+            "price_before": float(price_before),
+            "price_after": float(price_after),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+        logger.info(
+            f"Trade executed | {market.symbol} | "
+            f"outcome={trade['outcome_name']} delta={delta:+.2f} "
+            f"cost=${cost:.4f} | price {price_before:.4f} -> {price_after:.4f}"
+        )
+        return trade
+
+    # ------------------------------------------------------------------
+    # Market data → signal conversion
+    # ------------------------------------------------------------------
+
+    def _market_data_to_signals(self, data: Dict) -> List[Dict]:
+        """Convert incoming market data into standardized signals."""
+        signals = []
+
+        # Price momentum signal
+        price_change_1m = data.get("price_change_1m", 0.0)
+        if abs(price_change_1m) > 0.1:
+            signals.append({
+                "signal_type": "price_move",
+                "strength": min(abs(price_change_1m) / 2.0, 1.0),
+                "direction": "up" if price_change_1m > 0 else "down",
+                "metadata": {"source": "1m_price_change", "value": price_change_1m},
+            })
+
+        # RSI signal
+        rsi = data.get("rsi", 50.0)
+        if rsi < 30 or rsi > 70:
+            signals.append({
+                "signal_type": "technical",
+                "strength": min(abs(rsi - 50) / 50.0, 1.0),
+                "direction": "up" if rsi < 30 else "down",
+                "metadata": {"source": "rsi", "value": rsi},
+            })
+
+        # Volume signal
+        avg_volume = data.get("avg_volume", 0)
+        if avg_volume > 100_000:
+            trend = data.get("trend", "neutral")
+            signals.append({
+                "signal_type": "volume_spike",
+                "strength": min(avg_volume / 1_000_000, 1.0),
+                "direction": "up" if trend == "uptrend" else "down",
+                "metadata": {"source": "volume", "value": avg_volume},
+            })
+
+        # MACD signal
+        macd = data.get("macd", 0.0)
+        if abs(macd) > 0.0001:
+            signals.append({
+                "signal_type": "technical",
+                "strength": min(abs(macd) * 1000, 1.0),
+                "direction": "up" if macd > 0 else "down",
+                "metadata": {"source": "macd", "value": macd},
+            })
+
+        # Bollinger Band position signal
+        bb_pos = data.get("bb_position", 0.5)
+        if bb_pos < 0.2 or bb_pos > 0.8:
+            signals.append({
+                "signal_type": "technical",
+                "strength": abs(bb_pos - 0.5) * 2.0,
+                "direction": "up" if bb_pos < 0.2 else "down",
+                "metadata": {"source": "bollinger", "value": bb_pos},
+            })
+
+        # Trend strength signal
+        trend_strength = data.get("trend_strength", 0.0)
+        trend = data.get("trend", "neutral")
+        if trend_strength > 0.3 and trend != "neutral":
+            signals.append({
+                "signal_type": "price_move",
+                "strength": trend_strength,
+                "direction": "up" if trend == "uptrend" else "down",
+                "metadata": {"source": "trend", "value": trend_strength},
+            })
+
+        return signals
+
+    def _social_data_to_signals(self, data: Dict) -> List[Dict]:
+        """Convert social sentiment data into signals."""
+        signals = []
+        metrics = data.get("data", {}).get("metrics", {})
+        weighted_sentiment = data.get("data", {}).get("weighted_sentiment", 0.5)
+
+        if abs(weighted_sentiment - 0.5) > 0.1:
+            signals.append({
+                "signal_type": "social",
+                "strength": abs(weighted_sentiment - 0.5) * 2.0,
+                "direction": "up" if weighted_sentiment > 0.5 else "down",
+                "metadata": {"source": "sentiment", "value": weighted_sentiment},
+            })
+
+        social_volume = metrics.get("social_volume", 0)
+        if social_volume > 5000:
+            signals.append({
+                "signal_type": "sentiment",
+                "strength": min(social_volume / 50_000, 1.0),
+                "direction": "up" if weighted_sentiment > 0.5 else "down",
+                "metadata": {"source": "social_volume", "value": social_volume},
+            })
+
+        return signals
+
+    # ------------------------------------------------------------------
+    # Redis integration
+    # ------------------------------------------------------------------
+
+    async def connect_redis(self) -> bool:
+        """Connect to Redis with retry logic."""
+        redis_host = os.getenv('REDIS_HOST', 'localhost')
+        redis_port = int(os.getenv('REDIS_PORT', 6379))
+        max_retries = 5
+
+        for attempt in range(max_retries):
+            try:
+                self.redis = Redis(
+                    host=redis_host, port=redis_port,
+                    decode_responses=True, socket_timeout=5
+                )
+                await self.redis.ping()
+                logger.info(f"Connected to Redis at {redis_host}:{redis_port}")
+                return True
+            except (ConnectionError, Exception) as e:
+                wait = 2 ** attempt
+                logger.warning(
+                    f"Redis connection attempt {attempt+1}/{max_retries} failed: {e}. "
+                    f"Retrying in {wait}s..."
+                )
+                await asyncio.sleep(wait)
+
+        logger.error("Failed to connect to Redis after all retries")
+        return False
+
+    async def publish_opportunity(self, market_id: str, opportunity: Dict):
+        """Publish a trading opportunity to Redis."""
+        if not self.redis:
+            return
+
+        market = self.markets.get(market_id)
+        message = {
+            "source": "lmsr_prediction_bot",
+            "market_id": market_id,
+            "symbol": market.symbol if market else "UNKNOWN",
+            "opportunity": opportunity,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+        try:
+            await self.redis.publish("lmsr_signals", json.dumps(message))
+            logger.debug(f"Published opportunity for {market_id}")
+        except Exception as e:
+            logger.error(f"Failed to publish opportunity: {e}")
+
+    async def publish_market_state(self, market_id: str):
+        """Publish current market state to Redis."""
+        if not self.redis:
+            return
+
+        state = self.get_market_state(market_id)
+        if state:
+            try:
+                await self.redis.set(
+                    f"lmsr:market:{market_id}",
+                    json.dumps(state),
+                    ex=300,
+                )
+            except Exception as e:
+                logger.error(f"Failed to publish market state: {e}")
+
+    async def listen_market_updates(self):
+        """Subscribe to market updates and process them."""
+        if not self.redis:
+            logger.error("Redis not connected")
+            return
+
+        pubsub = self.redis.pubsub()
+        await pubsub.subscribe("market_updates")
+        logger.info("Subscribed to market_updates channel")
+
+        async for message in pubsub.listen():
+            if not self.running:
+                break
+            if message["type"] != "message":
+                continue
+
+            try:
+                data = json.loads(message["data"])
+                symbol = data.get("symbol", "")
+
+                if not symbol:
+                    continue
+
+                # Ensure a market exists for this symbol
+                market_id = self._get_or_create_market(symbol)
+
+                # Convert market data to signals and process
+                signals = self._market_data_to_signals(data)
+                all_opportunities = []
+
+                for signal in signals:
+                    opps = self.process_market_signal(market_id, signal)
+                    if opps:
+                        all_opportunities.extend(opps)
+
+                # Publish best opportunities
+                if all_opportunities:
+                    # De-duplicate by outcome_idx, keep highest edge
+                    best = {}
+                    for opp in all_opportunities:
+                        idx = opp["outcome_idx"]
+                        if idx not in best or opp["abs_edge"] > best[idx]["abs_edge"]:
+                            best[idx] = opp
+                    for opp in best.values():
+                        await self.publish_opportunity(market_id, opp)
+
+                # Periodically publish state
+                await self.publish_market_state(market_id)
+
+            except json.JSONDecodeError:
+                logger.warning("Received invalid JSON on market_updates")
+            except Exception as e:
+                logger.error(f"Error processing market update: {e}", exc_info=True)
+
+    async def listen_social_updates(self):
+        """Subscribe to social data and incorporate into beliefs."""
+        if not self.redis:
+            return
+
+        pubsub = self.redis.pubsub()
+        await pubsub.subscribe("social_updates")
+        logger.info("Subscribed to social_updates channel")
+
+        async for message in pubsub.listen():
+            if not self.running:
+                break
+            if message["type"] != "message":
+                continue
+
+            try:
+                data = json.loads(message["data"])
+                symbol = data.get("symbol", "")
+                if not symbol:
+                    continue
+
+                market_id = self._get_or_create_market(symbol)
+                signals = self._social_data_to_signals(data)
+
+                for signal in signals:
+                    self.process_market_signal(market_id, signal)
+
+            except Exception as e:
+                logger.error(f"Error processing social update: {e}", exc_info=True)
+
+    def _get_or_create_market(self, symbol: str) -> str:
+        """Get existing market for symbol or create a new one."""
+        for mid, m in self.markets.items():
+            if m.symbol == symbol and not m.resolved:
+                return mid
+        market = self.create_binary_market(symbol)
+        return market.market_id
+
+    # ------------------------------------------------------------------
+    # Status / monitoring
+    # ------------------------------------------------------------------
+
+    def get_status(self) -> Dict:
+        """Get bot status summary."""
+        market_states = []
+        for mid in self.markets:
+            state = self.get_market_state(mid)
+            if state:
+                market_states.append(state)
+
+        return {
+            "active_markets": len(self.markets),
+            "resolved_markets": sum(1 for m in self.markets.values() if m.resolved),
+            "liquidity_parameter": self.liquidity,
+            "max_maker_loss_binary": float(self.pricing_engine.max_loss(2)),
+            "min_edge_threshold": self.min_edge,
+            "markets": market_states,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+    # ------------------------------------------------------------------
+    # Main run loop
+    # ------------------------------------------------------------------
+
+    async def run(self):
+        """Main entry point: connect to Redis and start processing."""
+        logger.info("=" * 60)
+        logger.info("LMSR Prediction Bot starting")
+        logger.info(f"  Liquidity (b): {self.liquidity:,.0f}")
+        logger.info(f"  Max maker loss (binary): ${self.pricing_engine.max_loss(2):,.2f}")
+        logger.info(f"  Min edge threshold: {self.min_edge}")
+        logger.info(f"  Max Kelly fraction: {self.max_kelly_fraction}")
+        logger.info(f"  Signal learning rate: {self.signal_learning_rate}")
+        logger.info("=" * 60)
+
+        connected = await self.connect_redis()
+        if not connected:
+            logger.error("Cannot start without Redis connection. Exiting.")
+            return
+
+        # Run both listeners concurrently
+        try:
+            await asyncio.gather(
+                self.listen_market_updates(),
+                self.listen_social_updates(),
+                self._status_loop(),
+            )
+        except asyncio.CancelledError:
+            logger.info("Bot tasks cancelled")
+        except Exception as e:
+            logger.error(f"Bot error: {e}", exc_info=True)
+        finally:
+            self.running = False
+            if self.redis:
+                await self.redis.close()
+            logger.info("LMSR Prediction Bot stopped")
+
+    async def _status_loop(self):
+        """Periodically log bot status."""
+        while self.running:
+            await asyncio.sleep(60)
+            status = self.get_status()
+            logger.info(
+                f"Status | markets={status['active_markets']} | "
+                f"resolved={status['resolved_markets']}"
+            )
+            if self.redis:
+                try:
+                    await self.redis.set(
+                        "lmsr:bot:status",
+                        json.dumps(status),
+                        ex=120,
+                    )
+                except Exception:
+                    pass
