@@ -172,7 +172,8 @@
         "min_liquidity": 10000,
         "market_tags": [],
         "active_only": true,
-        "request_interval_sec": 1.0
+        "request_interval_sec": 1.0,
+        "use_websocket": true
     },
     "worker_defaults": {
         "routes": {

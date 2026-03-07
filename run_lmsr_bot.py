@@ -83,6 +83,10 @@ def parse_args():
         '--max-markets', type=int, default=None,
         help='Maximum number of Polymarket markets to track.'
     )
+    poly_group.add_argument(
+        '--no-websocket', action='store_true', default=False,
+        help='Use REST polling instead of WebSocket streaming.'
+    )
 
     return parser.parse_args()
 
@@ -132,6 +136,10 @@ def main():
         bot.poly_max_markets = args.max_markets
         logging.info(f"Override: max_markets = {args.max_markets}")
 
+    if args.no_websocket:
+        bot.poly_use_websocket = False
+        logging.info("Override: using REST polling instead of WebSocket")
+
     # Print configuration summary
     print("\n" + "=" * 60)
     print("  LMSR Prediction Market Bot (Polymarket)")
@@ -144,7 +152,9 @@ def main():
     print(f"  Max position size:    {bot.max_position_size:>12.1%}")
     print(f"  Max open positions:   {bot.max_open_positions:>12d}")
     print("-" * 60)
+    feed_mode = "WebSocket (real-time)" if bot.poly_use_websocket else f"REST polling ({bot.poly_poll_interval:.0f}s)"
     print(f"  Polymarket CLOB:      {'https://clob.polymarket.com':>30s}")
+    print(f"  Data feed:            {feed_mode:>30s}")
     print(f"  Poll interval:        {bot.poly_poll_interval:>11.0f}s")
     print(f"  Max tracked markets:  {bot.poly_max_markets:>12d}")
     print(f"  Auto-trade:           {'ENABLED' if bot.poly_auto_trade else 'DISABLED':>12s}")

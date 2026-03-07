@@ -5,8 +5,9 @@ import asyncio
 import logging as logger
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import AsyncIterator, Callable, Dict, List, Optional
 import aiohttp
+import websockets
 
 # Create logs directory if it doesn't exist
 os.makedirs('logs', exist_ok=True)
@@ -412,6 +413,110 @@ class PolymarketClient:
         except Exception as e:
             logger.error(f"Failed to get balance: {e}")
             return None
+
+    # ------------------------------------------------------------------
+    # WebSocket — Real-time price & order book streaming
+    # ------------------------------------------------------------------
+
+    async def stream_market_events(
+        self,
+        token_ids: List[str],
+        on_event: Callable,
+        ping_interval: float = 10.0,
+    ):
+        """
+        Connect to Polymarket CLOB WebSocket and stream order book / price events.
+
+        WebSocket URL: wss://ws-subscriptions-clob.polymarket.com/ws/market
+        Subscribe msg: {"type": "market", "assets_ids": [token_id, ...]}
+        Keep-alive:    send "PING" every ~10s
+
+        Event types received:
+          - book:             full order book snapshot
+          - price_change:     best bid/ask changed
+          - last_trade_price: last executed trade price
+          - tick_size_change:  tick size update
+
+        Args:
+            token_ids: List of outcome token IDs to subscribe to.
+            on_event: Async callback(event_dict) called for each event.
+            ping_interval: Seconds between keep-alive pings.
+        """
+        ws_market_url = f"{self.ws_url}/ws/market"
+        reconnect_delay = 1.0
+
+        while True:
+            try:
+                async with websockets.connect(ws_market_url) as ws:
+                    # Subscribe to market channel
+                    subscribe_msg = json.dumps({
+                        "type": "market",
+                        "assets_ids": token_ids,
+                    })
+                    await ws.send(subscribe_msg)
+                    logger.info(
+                        f"WebSocket connected | subscribed to {len(token_ids)} tokens"
+                    )
+                    reconnect_delay = 1.0  # reset on successful connect
+
+                    # Run ping loop and message receiver concurrently
+                    async def _ping_loop():
+                        while True:
+                            await asyncio.sleep(ping_interval)
+                            try:
+                                await ws.send("PING")
+                            except Exception:
+                                return
+
+                    async def _receive_loop():
+                        async for raw_msg in ws:
+                            if raw_msg == "PONG":
+                                continue
+                            try:
+                                events = json.loads(raw_msg)
+                                # Events arrive as JSON arrays (batched)
+                                if isinstance(events, list):
+                                    for event in events:
+                                        await on_event(event)
+                                elif isinstance(events, dict):
+                                    await on_event(events)
+                            except json.JSONDecodeError:
+                                logger.debug(f"WS non-JSON message: {raw_msg[:80]}")
+
+                    ping_task = asyncio.create_task(_ping_loop())
+                    try:
+                        await _receive_loop()
+                    finally:
+                        ping_task.cancel()
+
+            except (
+                websockets.ConnectionClosed,
+                websockets.InvalidStatusCode,
+                ConnectionRefusedError,
+                OSError,
+            ) as e:
+                logger.warning(
+                    f"WebSocket disconnected: {e}. "
+                    f"Reconnecting in {reconnect_delay:.0f}s..."
+                )
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, 60.0)
+            except asyncio.CancelledError:
+                logger.info("WebSocket stream cancelled")
+                return
+            except Exception as e:
+                logger.error(f"WebSocket error: {e}", exc_info=True)
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, 60.0)
+
+    async def subscribe_additional_tokens(self, ws, token_ids: List[str]):
+        """Subscribe to additional tokens on an existing WebSocket connection."""
+        subscribe_msg = json.dumps({
+            "type": "market",
+            "assets_ids": token_ids,
+        })
+        await ws.send(subscribe_msg)
+        logger.info(f"Subscribed to {len(token_ids)} additional tokens")
 
     # ------------------------------------------------------------------
     # Market data helpers

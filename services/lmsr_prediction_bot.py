@@ -293,6 +293,7 @@ class LMSRPredictionBot:
         self.poly_max_markets = poly_config.get("max_tracked_markets", 20)
         self.poly_auto_trade = poly_config.get("auto_trade", False)
         self.poly_order_size = poly_config.get("default_order_size", 10.0)
+        self.poly_use_websocket = poly_config.get("use_websocket", True)
 
         self.redis: Optional[Redis] = None
         self.running = True
@@ -509,11 +510,11 @@ class LMSRPredictionBot:
 
     async def poll_polymarket_prices(self):
         """
-        Continuously poll Polymarket CLOB for price updates.
-        Generates signals from price movements and detects inefficiencies.
+        Fallback: poll Polymarket CLOB REST API for price updates.
+        Used when WebSocket is disabled (--no-websocket).
         """
         logger.info(
-            f"Starting Polymarket price polling | "
+            f"Starting Polymarket REST polling | "
             f"interval={self.poly_poll_interval}s | "
             f"auto_trade={self.poly_auto_trade}"
         )
@@ -528,54 +529,11 @@ class LMSRPredictionBot:
                     if not prices:
                         continue
 
-                    # Build price snapshot
-                    snapshot = {
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                        "prices": prices,
-                    }
-                    history = self.price_history.get(condition_id, [])
-                    history.append(snapshot)
-                    # Keep last 100 snapshots
-                    if len(history) > 100:
-                        history = history[-100:]
-                    self.price_history[condition_id] = history
-
-                    # Find the internal market
                     market_id = self._find_market_for_condition(condition_id)
                     if not market_id:
                         continue
 
-                    # Generate signals from price movements
-                    signals = self._polymarket_price_to_signals(condition_id, prices)
-
-                    all_opportunities = []
-                    for signal in signals:
-                        opps = self.process_market_signal(market_id, signal)
-                        if opps:
-                            all_opportunities.extend(opps)
-
-                    # Check for inefficiencies against live Polymarket prices
-                    if all_opportunities:
-                        best = self._deduplicate_opportunities(all_opportunities)
-                        for opp in best:
-                            opp["condition_id"] = condition_id
-                            opp["polymarket_tokens"] = pm.get("tokens", [])
-                            opp["question"] = pm.get("question", "")
-
-                            logger.info(
-                                f"OPPORTUNITY | {pm['question'][:60]} | "
-                                f"{opp['direction']} outcome={opp['outcome_idx']} | "
-                                f"edge={opp['edge']:.4f} kelly={opp['kelly_fraction']:.4f} | "
-                                f"market={opp['market_price']:.4f} model={opp['model_belief']:.4f}"
-                            )
-
-                            # Execute trade if auto_trade is enabled
-                            if self.poly_auto_trade:
-                                await self._execute_polymarket_trade(opp)
-
-                            # Publish to Redis
-                            if self.redis:
-                                await self.publish_opportunity(market_id, opp)
+                    await self._process_price_update(condition_id, market_id, pm, prices)
 
                 except Exception as e:
                     logger.error(
@@ -696,6 +654,187 @@ class LMSRPredictionBot:
             if idx not in best or opp["abs_edge"] > best[idx]["abs_edge"]:
                 best[idx] = opp
         return list(best.values())
+
+    # ------------------------------------------------------------------
+    # WebSocket streaming (real-time Polymarket events)
+    # ------------------------------------------------------------------
+
+    async def start_websocket_stream(self):
+        """
+        Connect to Polymarket CLOB WebSocket for real-time price updates.
+        Processes book, price_change, and last_trade_price events into
+        Bayesian signals with ~120ms latency (vs 10s polling).
+        """
+        # Collect all token IDs from tracked markets
+        token_ids = []
+        # token_id -> (condition_id, outcome_name) mapping
+        self._ws_token_map: Dict[str, tuple] = {}
+
+        for condition_id, pm in self.poly_markets.items():
+            for token in pm.get("tokens", []):
+                tid = token.get("token_id", "")
+                outcome = token.get("outcome", "")
+                if tid:
+                    token_ids.append(tid)
+                    self._ws_token_map[tid] = (condition_id, outcome)
+
+        if not token_ids:
+            logger.warning("No token IDs to subscribe to — skipping WebSocket")
+            # Fall back to polling
+            await self.poll_polymarket_prices()
+            return
+
+        logger.info(
+            f"Starting WebSocket stream for {len(token_ids)} tokens "
+            f"across {len(self.poly_markets)} markets"
+        )
+
+        await self.polymarket.stream_market_events(
+            token_ids=token_ids,
+            on_event=self._handle_ws_event,
+        )
+
+    async def _handle_ws_event(self, event: Dict):
+        """
+        Process a single WebSocket event from Polymarket CLOB.
+
+        Event types:
+          - book: full order book snapshot (bids/asks)
+          - price_change: best bid/ask changed
+          - last_trade_price: last executed trade price
+        """
+        event_type = event.get("event_type", "")
+        asset_id = event.get("asset_id", "")
+
+        if not asset_id or asset_id not in self._ws_token_map:
+            return
+
+        condition_id, outcome = self._ws_token_map[asset_id]
+        pm = self.poly_markets.get(condition_id)
+        if not pm:
+            return
+
+        market_id = self._find_market_for_condition(condition_id)
+        if not market_id:
+            return
+
+        if event_type == "price_change":
+            # Extract new prices from the event
+            prices = self._extract_prices_from_ws(event, condition_id)
+            if prices:
+                await self._process_price_update(condition_id, market_id, pm, prices)
+
+        elif event_type == "book":
+            # Full book snapshot — extract best bid/ask as prices
+            prices = self._extract_prices_from_book(event, condition_id)
+            if prices:
+                await self._process_price_update(condition_id, market_id, pm, prices)
+
+        elif event_type == "last_trade_price":
+            price = event.get("price")
+            if price is not None:
+                price = float(price)
+                # Generate a quick signal from a trade execution
+                history = self.price_history.get(condition_id, [])
+                if history:
+                    prev_prices = history[-1].get("prices", {})
+                    prev_price = prev_prices.get(outcome, prev_prices.get(outcome.upper(), 0.5))
+                    delta = price - prev_price
+                    if abs(delta) > 0.003:
+                        signal = {
+                            "signal_type": "price_move",
+                            "strength": min(abs(delta) / 0.03, 1.0),
+                            "direction": "up" if (delta > 0 and outcome in ("Yes", "YES")) or
+                                                  (delta < 0 and outcome in ("No", "NO")) else "down",
+                            "metadata": {"source": "ws_last_trade", "value": delta},
+                        }
+                        self.process_market_signal(market_id, signal)
+
+    def _extract_prices_from_ws(self, event: Dict, condition_id: str) -> Dict[str, float]:
+        """Extract YES/NO prices from a price_change WebSocket event."""
+        prices = {}
+        # price_change events contain price data per asset
+        asset_id = event.get("asset_id", "")
+        if asset_id in self._ws_token_map:
+            _, outcome = self._ws_token_map[asset_id]
+            # Try different price field names
+            for field in ("price", "mid", "best_bid", "best_ask"):
+                val = event.get(field)
+                if val is not None:
+                    prices[outcome] = float(val)
+                    break
+
+            # Fill in the complementary outcome price
+            if prices and len(prices) == 1:
+                for name, p in prices.items():
+                    complement = "No" if name in ("Yes", "YES") else "Yes"
+                    prices[complement] = round(1.0 - p, 4)
+
+        return prices
+
+    def _extract_prices_from_book(self, event: Dict, condition_id: str) -> Dict[str, float]:
+        """Extract midpoint prices from a book WebSocket event."""
+        prices = {}
+        asset_id = event.get("asset_id", "")
+        if asset_id not in self._ws_token_map:
+            return prices
+
+        _, outcome = self._ws_token_map[asset_id]
+        bids = event.get("bids", [])
+        asks = event.get("asks", [])
+
+        if bids and asks:
+            best_bid = float(bids[0].get("price", 0))
+            best_ask = float(asks[0].get("price", 1))
+            mid = (best_bid + best_ask) / 2.0
+            prices[outcome] = mid
+            complement = "No" if outcome in ("Yes", "YES") else "Yes"
+            prices[complement] = round(1.0 - mid, 4)
+
+        return prices
+
+    async def _process_price_update(self, condition_id: str, market_id: str,
+                                    pm: Dict, prices: Dict[str, float]):
+        """Process a price update (from either WS or polling) through the signal pipeline."""
+        # Record snapshot
+        snapshot = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "prices": prices,
+        }
+        history = self.price_history.get(condition_id, [])
+        history.append(snapshot)
+        if len(history) > 100:
+            history = history[-100:]
+        self.price_history[condition_id] = history
+
+        # Generate signals
+        signals = self._polymarket_price_to_signals(condition_id, prices)
+        all_opportunities = []
+
+        for signal in signals:
+            opps = self.process_market_signal(market_id, signal)
+            if opps:
+                all_opportunities.extend(opps)
+
+        if all_opportunities:
+            best = self._deduplicate_opportunities(all_opportunities)
+            for opp in best:
+                opp["condition_id"] = condition_id
+                opp["polymarket_tokens"] = pm.get("tokens", [])
+                opp["question"] = pm.get("question", "")
+
+                logger.info(
+                    f"OPPORTUNITY | {pm['question'][:60]} | "
+                    f"{opp['direction']} outcome={opp['outcome_idx']} | "
+                    f"edge={opp['edge']:.4f} kelly={opp['kelly_fraction']:.4f} | "
+                    f"market={opp['market_price']:.4f} model={opp['model_belief']:.4f}"
+                )
+
+                if self.poly_auto_trade:
+                    await self._execute_polymarket_trade(opp)
+
+                if self.redis:
+                    await self.publish_opportunity(market_id, opp)
 
     # ------------------------------------------------------------------
     # Market data → signal conversion (Redis-sourced data)
@@ -985,6 +1124,7 @@ class LMSRPredictionBot:
         logger.info(f"  Min edge threshold: {self.min_edge}")
         logger.info(f"  Max Kelly fraction: {self.max_kelly_fraction}")
         logger.info(f"  Signal learning rate: {self.signal_learning_rate}")
+        logger.info(f"  Data feed: {'WebSocket (real-time)' if self.poly_use_websocket else 'Polling'}")
         logger.info(f"  Polymarket poll interval: {self.poly_poll_interval}s")
         logger.info(f"  Auto-trade: {self.poly_auto_trade}")
         logger.info("=" * 60)
@@ -1001,12 +1141,15 @@ class LMSRPredictionBot:
                 "(no Redis pub/sub signals)"
             )
 
-        # Build task list
-        tasks = [
-            self.poll_polymarket_prices(),
-            self._polymarket_discovery_loop(),
-            self._status_loop(),
-        ]
+        # Build task list — WebSocket streaming (primary) or polling (fallback)
+        tasks = []
+        if self.poly_use_websocket:
+            tasks.append(self.start_websocket_stream())
+        else:
+            tasks.append(self.poll_polymarket_prices())
+        tasks.append(self._polymarket_discovery_loop())
+        tasks.append(self._status_loop())
+
         if connected:
             tasks.append(self.listen_market_updates())
             tasks.append(self.listen_social_updates())
